@@ -2,349 +2,428 @@
 session_start();
 include 'db.php';
 
-// ===== CHECK ADMIN LOGIN =====
-if(!isset($_SESSION['admin_id'])){
-    header("Location: admin_login.php");
+// ===== LOAD SYSTEM THEME =====
+if (!isset($_SESSION['theme_mode'])) {
+    $themeResult = $conn->query("SELECT setting_value FROM settings WHERE setting_name='theme_mode'");
+    $_SESSION['theme_mode'] = ($themeResult->num_rows > 0) ? $themeResult->fetch_assoc()['setting_value'] : 'light';
+}
+$currentTheme = $_SESSION['theme_mode'];
+
+// ===== CHECK LOGIN =====
+if (!isset($_SESSION['user_id'])) {
+    header("Location: login.php");
     exit();
 }
-$admin_name = $_SESSION['admin_name'] ?? 'Admin';
+$user_id = $_SESSION['user_id'];
+$user_name = $_SESSION['user_name'] ?? 'User';
 
-// ===== FORMAT PHONE =====
-function formatPhone($number) {
-    $number = preg_replace('/\D/', '', $number);
-    if (substr($number, 0, 2) === "94" && strlen($number) === 11) return "+".$number;
-    if (substr($number, 0, 1) === "0" && strlen($number) === 10) return "+94".substr($number, 1);
-    if (substr($number, 0, 1) === "8" && strlen($number) === 10) return "+94".substr($number, 1);
-    if (substr($number, 0, 4) === "0094") return "+".substr($number, 2);
-    return "+94".$number;
+// ===== ADD COLUMNS IF NOT EXISTS =====
+$conn->query("ALTER TABLE call_log ADD COLUMN IF NOT EXISTS visit_status VARCHAR(50) DEFAULT 'Pending'");
+$conn->query("ALTER TABLE call_log ADD COLUMN IF NOT EXISTS bonus_amount DECIMAL(10,2) DEFAULT 0");
+
+// ===== FILTER HANDLER =====
+$search = $_GET['search'] ?? '';
+$status_filter = $_GET['status'] ?? '';
+$filter_type = $_GET['filter_type'] ?? 'all';
+$from_date = $_GET['from_date'] ?? '';
+$to_date = $_GET['to_date'] ?? '';
+
+$sql = "
+    SELECT 
+        id, 
+        customer_name, 
+        number_called, 
+        appointment_reason, 
+        appointment_date, 
+        visit_status, 
+        bonus_amount 
+    FROM call_log 
+    WHERE user_id = ?
+      AND appointment_date IS NOT NULL
+";
+
+$params = [$user_id];
+$types = "i";
+
+// === FILTER CONDITIONS ===
+if ($search !== '') {
+    $sql .= " AND customer_name LIKE ?";
+    $params[] = "%$search%";
+    $types .= "s";
 }
 
-// ===== FETCH ALL APPOINTMENTS =====
-$stmt = $conn->prepare("
-    SELECT c.*, u.user_name
-    FROM call_log c
-    LEFT JOIN manageuser u ON c.user_id = u.id
-    WHERE c.appointment_date IS NOT NULL
-    ORDER BY c.appointment_date ASC
-");
+if ($status_filter !== '') {
+    $sql .= " AND visit_status = ?";
+    $params[] = $status_filter;
+    $types .= "s";
+}
+
+// Filter by period
+switch ($filter_type) {
+    case 'today':
+        $sql .= " AND DATE(appointment_date) = CURDATE()";
+        break;
+    case 'this_week':
+        $sql .= " AND YEARWEEK(appointment_date, 1) = YEARWEEK(CURDATE(), 1)";
+        break;
+    case 'this_month':
+        $sql .= " AND MONTH(appointment_date) = MONTH(CURDATE()) AND YEAR(appointment_date) = YEAR(CURDATE())";
+        break;
+    case 'this_year':
+        $sql .= " AND YEAR(appointment_date) = YEAR(CURDATE())";
+        break;
+    case 'custom':
+        if ($from_date && $to_date) {
+            $sql .= " AND DATE(appointment_date) BETWEEN ? AND ?";
+            $params[] = $from_date;
+            $params[] = $to_date;
+            $types .= "ss";
+        }
+        break;
+}
+
+$sql .= " ORDER BY appointment_date DESC";
+$stmt = $conn->prepare($sql);
+$stmt->bind_param($types, ...$params);
 $stmt->execute();
 $result = $stmt->get_result();
 
-$appointments = [];
-$soldCount = $visitedCount = $cancelledCount = $pendingCount = 0;
-
-while($row = $result->fetch_assoc()){
-    $row['number_called'] = formatPhone($row['number_called']);
-    $appointments[] = $row;
-
-    // Count status
-    if($row['visit_status'] === 'Sold') $soldCount++;
-    else if($row['visit_status'] === 'Visited') $visitedCount++;
-    else if($row['visit_status'] === 'Cancelled') $cancelledCount++;
-    else $pendingCount++;
-}
-
-// ===== BADGE COLOR =====
-function badgeColor($date){
-    $today = date('Y-m-d');
-    $tomorrow = date('Y-m-d', strtotime('+1 day'));
-    if($date === $today) return 'primary';
-    if($date === $tomorrow) return 'success';
-    return 'warning';
-}
+// ===== BONUS SUMMARY =====
+$bonusStmt = $conn->prepare("SELECT SUM(bonus_amount) AS total_bonus FROM call_log WHERE user_id=?");
+$bonusStmt->bind_param("i", $user_id);
+$bonusStmt->execute();
+$total_bonus = $bonusStmt->get_result()->fetch_assoc()['total_bonus'] ?? 0;
 ?>
 <!DOCTYPE html>
-<html>
+<html lang="en" data-bs-theme="<?= htmlspecialchars($currentTheme); ?>">
 <head>
 <meta charset="UTF-8">
-<title>Admin Appointments</title>
-
-<!-- ===== CSS ===== -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Appointment List | Commercial Realty (Pvt) Ltd</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-<link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
-<link href="https://cdn.datatables.net/buttons/2.4.1/css/buttons.bootstrap5.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-
 <style>
-body { font-family:'Poppins',sans-serif; background:#f4f6f9; margin:0; }
-/* ===== Sidebar ===== */
-.sidebar { position: fixed; top:0; left:0; width:230px; height:100vh; background:#0b1b58; color:#fff; padding-top:20px; overflow-y:auto; transition: all 0.3s ease; z-index:999; }
-.sidebar img.logo { width:180px; margin:0 auto 10px; display:block; }
-.sidebar .address { font-size:12px; color:rgba(255,255,255,0.7); text-align:center; margin-bottom:10px; }
-.sidebar .welcome { font-size:0.9rem; color:#ffc107; text-align:center; font-weight:500; margin-bottom:20px; }
-.sidebar a, .sidebar button { display:block; width:100%; padding:10px 20px; color:white; text-decoration:none; font-size:14px; background:none; border:none; text-align:left; border-radius:6px; transition:0.3s; cursor:pointer; }
-.sidebar a:hover, .sidebar button:hover { background: rgba(255,255,255,0.15); border-left:4px solid #ffc107; }
-.sidebar a.active { background: rgba(255,255,255,0.15); border-left:4px solid #ffc107; }
-.sidebar .dropdown-container{ display:none; background:rgba(0,0,0,0.05); border-radius:5px; margin-left:10px; }
-.sidebar .dropdown-container a{ padding-left:35px; font-size:13px; border-radius:4px; }
-.logout-btn{ position:absolute; bottom:20px; width:100%; }
-.logout-btn a{ background: rgba(255,255,255,0.1); font-weight:500; color:#ffc107; display:flex; align-items:center; justify-content:center; }
-.sidebar i {margin-right:8px;}
-/* ===== CONTENT ===== */
-.content {margin-left:280px; padding:20px;}
-.table thead th {background:#0b1b58; color:white;}
-.badge-status {font-size:12px;}
-.card-status {margin-bottom:20px;}
-.user-guide { background:#fff8e1; border-left:4px solid #ffc107; padding:12px 15px; border-radius:6px; font-size:14px; color:#444; opacity:0; transform:translateY(20px); animation: slideFadeIn 0.8s ease-out forwards; }
-@keyframes slideFadeIn { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
-#toastContainer { position: fixed; top:20px; right:20px; z-index: 1050; }
-.toast { min-width: 250px; }
+:root {
+    --sidebar-bg: linear-gradient(180deg, #00205C);
+    --sidebar-color: white;
+    --sidebar-hover: rgba(255,255,255,0.2);
+    --bg-body: #eef2f7;
+}
+body { font-family:'Poppins',sans-serif; background:var(--bg-body); margin:0; }
+
+/* Sidebar */
+.sidebar {
+    position: fixed;
+    top:0;
+    left:0;
+    width:220px;
+    height:100vh;
+    background: var(--sidebar-bg);
+    color: var(--sidebar-color);
+    overflow-y:auto;
+    padding-top:20px;
+    text-align:center;
+}
+.sidebar .sidebar-header img.logo {
+    width:180px;
+    border-radius:5px;
+    margin-bottom:5px;
+}
+.sidebar .sidebar-header p {
+    font-size:0.8rem;
+    color:rgba(230,230,230,0.9);
+    margin:2px 0;
+}
+.sidebar a, .sidebar button {
+    display:block;
+    color:var(--sidebar-color);
+    text-decoration:none;
+    padding:10px 15px;
+    font-size:14px;
+    border:none;
+    background:none;
+    width:100%;
+    text-align:left;
+    transition:0.3s;
+}
+.sidebar a:hover, .sidebar button:hover, .sidebar a.active {
+    background: var(--sidebar-hover);
+    border-left:4px solid #ffc107;
+}
+.sidebar .dropdown-container {
+    display:none;
+    background: rgba(0,0,0,0.15);
+}
+.sidebar .dropdown-container a {
+    padding-left:35px;
+    font-size:13px;
+}
+.logout-btn {
+    position:absolute;
+    bottom:20px;
+    width:100%;
+}
+
+/* Content */
+.content {
+    margin-left:220px;
+    padding:30px;
+    transition: margin-left 0.3s;
+}
+.container-box {
+    background:white;
+    border-radius:12px;
+    box-shadow:0 4px 12px rgba(0,0,0,0.08);
+    padding:25px;
+}
+.table thead {
+    background:#00205C;
+    color:white;
+}
+.table tbody tr {
+    transition: background-color 0.2s ease;
+    cursor:pointer;
+}
+.table tbody tr:hover {
+    background-color:#d9e8ff;
+}
+/* full row highlight */
+.status-badge {
+    padding:5px 12px;
+    border-radius:25px;
+    font-size:0.85rem;
+}
+.status-Pending{background-color:#ffc107;color:#000;}
+.status-Confirmed{background-color:#17a2b8;color:#fff;}
+.status-Visited{background-color:#28a745;color:#fff;}
+.status-Cancelled{background-color:#dc3545;color:#fff;}
+.summary-card { background: linear-gradient(135deg, #1500ff96, #00a6ffab); color:white; border-radius:10px; padding:20px; text-align:center; transition: transform 0.2s; }
+.summary-card:hover { transform: translateY(-3px); box-shadow:0 6px 15px rgba(0,0,0,0.15); }
+
+
+.user-guide {
+    background:#fff8e1;
+    border-left:4px solid #ffc107;
+    padding:12px 15px;
+    border-radius:6px;
+    font-size:14px;
+    color:#444;
+    opacity:0;
+    transform:translateY(20px);
+    animation: slideFadeIn 0.8s ease-out forwards;
+}
+@keyframes slideFadeIn {
+    from { opacity:0;
+        transform:translateY(20px);
+    }
+    to {
+        opacity:1;
+        transform:translateY(0);
+    }
+}
+
+/* Responsive */
+@media(max-width:992px){ .sidebar{ position:relative; width:100%; height:auto; } .content{ margin-left:0; padding:20px; } .footer{ left:0; } }
+
+/* Filter enhancements */
+.form-label { font-size:0.85rem; }
 </style>
 </head>
 <body>
 
-<!-- SIDEBAR -->
-<div class="sidebar" id="sidebar">
-    <img src="CRealty.png" class="logo" alt="CR Logo">
-    <div class="address">2nd Floor, 132 Avissawella Rd, Maharagama 10280<br>📞 0114 389 900</div>
-    <div class="welcome">Welcome, <?= htmlspecialchars($admin_name) ?></div>
-    <a href="index.php"><i class="bi bi-house"></i> Dashboard</a>
-    <button class="dropdown-btn"><i class="bi bi-telephone"></i> Hotlines <i class="bi bi-caret-down-fill float-end"></i></button>
-    <div class="dropdown-container">
-        <a href="managehotlines.php">Manage Hotline</a>
-        <a href="view_hotline.php">View Hotline</a>
-        <a href="hotline_setting.php">Add Project</a>
+<!-- Sidebar -->
+<div class="sidebar">
+    <div class="sidebar-header">
+        <img src="CRealty.png" alt="Company Logo" class="logo">
+        <p>2nd Floor, 132 Avissawella Rd,<br>Maharagama 10280</p>
+        <p>👤 <?= htmlspecialchars($user_name); ?></p>
     </div>
-    <button class="dropdown-btn"><i class="bi bi-person-lines-fill"></i> Agents Management <i class="bi bi-caret-down-fill float-end"></i></button>
+    <a href="home.php"><i class="bi bi-house-door"></i> Dashboard</a>
+    <button class="dropdown-btn"><i class="bi bi-collection"></i> Call Target <i class="bi bi-caret-down-fill float-end"></i></button>
     <div class="dropdown-container">
-        <a href="manageuser.php">Agent Administration</a>
-        <a href="view_users.php">Agent Overview</a>
+        <a href="user_target.php"><i class="bi bi-bullseye"></i> Performance Goals</a>
+        <a href="view_user_calls.php"><i class="bi bi-telephone-outbound"></i> Performance Overview</a>
     </div>
-    <button class="dropdown-btn"><i class="bi bi-telephone-outbound"></i> Target Management <i class="bi bi-caret-down-fill float-end"></i></button>
-    <div class="dropdown-container">
-        <a href="usertarget.php">Call Targets</a>
-        <a href="viewtargetdetails.php">Target Overview</a>
-    </div>
-    <a href="call_timer.php"><i class="bi bi-clock-history"></i> Call Timer</a>
-    <a href="call_log.php"><i class="bi bi-journal-text"></i> Call Log</a>
+    <a href="missedcalls.php"><i class="bi bi-telephone"></i> Missed Calls</a>
 
-    <button class="dropdown-btn"><i class="bi bi-calendar-check"></i> Site Appointments <i class="bi bi-caret-down-fill float-end"></i></button>
-    <div class="dropdown-container" style="display:block;">
-        <a href="appointmentlist.php" class="active">Appointment List</a>
-        <a href="appointment_overview.php">Appointment Overview</a>
+    <button class="dropdown-btn"><i class="bi bi-clock me-2"></i> On Hold Calls <i class="bi bi-caret-down-fill float-end"></i></button>
+    <div class="dropdown-container">
+        <a href="onhold.php"><i class="bi bi-bullseye me-2"></i> Hold Calls</a>
+        <a href="reviewed_onhold.php"><i class="bi bi-telephone-outbound me-2"></i> Reviewed On Hold</a>
     </div>
 
-    <a href="reports.php"><i class="bi bi-bar-chart-line"></i> Reports</a>
-    <button class="dropdown-btn"><i class="bi bi-gear"></i> Setting <i class="bi bi-caret-down-fill float-end"></i></button>
+    <a href="view_user_appointments.php"><i class="bi bi-clock-history"></i> Scheduled Visits</a>
+    <a href="viewallcalllist.php"><i class="bi bi-journal-text"></i> View All Call List</a>
+    <a href="appointmentlist.php"><i class="bi bi-calendar-check"></i> Site Visits</a>
+    <a href="userreports.php"><i class="bi bi-bar-chart"></i> Reports</a>
+    <button class="dropdown-btn"><i class="bi bi-gear"></i> Settings <i class="bi bi-caret-down-fill float-end"></i></button>
     <div class="dropdown-container">
-        <a href="profilesetting.php">Profile Setting</a>
+        <a href="manage_reasons.php"><i class="bi bi-person-gear"></i> Manage System Settings</a>
     </div>
-    <div class="logout-btn"><a href="logout.php"><i class="bi bi-box-arrow-right"></i> Logout</a></div>
+    <div class="logout-btn">
+        <a href="logout.php"><i class="bi bi-box-arrow-right"></i> Logout</a>
+    </div>
 </div>
 
-<!-- CONTENT -->
+<!-- Main Content -->
 <div class="content">
-    <h3><i class="bi bi-calendar-event"></i> All Appointments</h3>
-    <p class="user-guide">“Manage appointment-based earnings efficiently: assign and track income for each appointment to ensure accurate performance monitoring and bonus calculations.”</p>
+    <div class="container-box">
+        <h4 class="mb-3 text-primary fw-semibold">Welcome, <?= htmlspecialchars($user_name); ?></h4>
+        <p class="user-guide">
+        Displays appointments or site visits planned for the day or week. Keeps agents organized.
+    </p>
 
-    <!-- STATUS CARDS -->
-    <div class="row">
-        <div class="col-md-3">
-            <div class="card text-white bg-success card-status">
-                <div class="card-body text-center">
-                    <h5 class="card-title">Sold</h5>
-                    <h3 id="soldCount"><?= $soldCount ?></h3>
-                </div>
-            </div>
+        <div class="summary-card mb-4">
+            <h4>Total Income Earned</h4>
+            <p style="font-size:1.4rem;">Rs. <?= number_format($total_bonus,2); ?></p>
         </div>
-        <div class="col-md-3">
-            <div class="card text-white bg-info card-status">
-                <div class="card-body text-center">
-                    <h5 class="card-title">Visited</h5>
-                    <h3 id="visitedCount"><?= $visitedCount ?></h3>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card text-white bg-danger card-status">
-                <div class="card-body text-center">
-                    <h5 class="card-title">Cancelled</h5>
-                    <h3 id="cancelledCount"><?= $cancelledCount ?></h3>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card text-white bg-secondary card-status">
-                <div class="card-body text-center">
-                    <h5 class="card-title">Pending</h5>
-                    <h3 id="pendingCount"><?= $pendingCount ?></h3>
-                </div>
-            </div>
-        </div>
-    </div>
 
-    <!-- APPOINTMENTS TABLE -->
-    <div class="table-responsive">
-        <table id="appointmentsTable" class="table table-bordered table-striped text-center">
-            <thead>
-                <tr>
-                    <th>#</th>
-                    <th>Customer</th>
-                    <th>Phone</th>
-                    <th>Project</th>
-                    <th>Reason</th>
-                    <th>Date</th>
-                    <th>User</th>
-                    <th>Status</th>
-                    <th>Income</th>
-                    <th>Action</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php $i=1; foreach($appointments as $app): ?>
-                <?php $color = badgeColor($app['appointment_date']); ?>
-                <tr id="row-<?= $app['id'] ?>">
-                    <td><?= $i++ ?></td>
-                    <td><?= $app['customer_name'] ?></td>
-                    <td><?= $app['number_called'] ?></td>
-                    <td><?= $app['project_name'] ?></td>
-                    <td><?= $app['appointment_reason'] ?></td>
-                    <td><span class="badge bg-<?= $color ?>"><?= $app['appointment_date'] ?></span></td>
-                    <td><?= $app['user_name'] ?></td>
-                    <td>
-                        <?php if($app['visit_status']): ?>
-                            <span class="badge bg-<?php
-                                if($app['visit_status']=='Sold') echo 'success';
-                                else if($app['visit_status']=='Visited') echo 'info';
-                                else if($app['visit_status']=='Cancelled') echo 'danger';
-                                else echo 'secondary';
-                            ?>"><?= $app['visit_status'] ?></span>
-                        <?php else: ?>
-                            <span class="badge bg-secondary">Pending</span>
-                        <?php endif; ?>
-                    </td>
-                    <td>Rs. <?= number_format($app['bonus_amount'],2) ?></td>
-                    <td>
-                        <button class="btn btn-success btn-sm statusBtn" data-id="<?= $app['id'] ?>" data-name="<?= $app['customer_name'] ?>">Update</button>
-                        <button class="btn btn-danger btn-sm cancelBtn" data-id="<?= $app['id'] ?>" data-name="<?= $app['customer_name'] ?>">Cancel</button>
-                    </td>
-                </tr>
-                <?php endforeach; ?>
-            </tbody>
-        </table>
-    </div>
-</div>
-
-<!-- MODAL -->
-<div class="modal fade" id="statusModal">
-    <div class="modal-dialog">
-        <form id="statusForm" class="modal-content">
-            <div class="modal-header bg-primary text-white">
-                <h5 class="modal-title">Update Appointment Status</h5>
+        <!-- Filters -->
+        <form method="get" class="row g-3 mb-4 align-items-end">
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Search Customer</label>
+                <input type="text" name="search" class="form-control" placeholder="Enter customer name..." value="<?= htmlspecialchars($search); ?>">
             </div>
-            <div class="modal-body">
-                <input type="hidden" id="update_id" name="id">
-                <label class="form-label">Select Status</label>
-                <select class="form-select" name="visit_status" required>
-                    <option value="">-- Select --</option>
-                    <option value="Visited">Visited (Site Visit)</option>
-                    <option value="Sold">Sold (Deal Closed)</option>
-                    <option value="Cancelled">Cancelled</option>
+            <div class="col-md-2">
+                <label class="form-label fw-semibold">Status</label>
+                <select name="status" class="form-select">
+                    <option value="">All</option>
+                    <option value="Pending" <?= $status_filter=='Pending'?'selected':''; ?>>Pending</option>
+                    <option value="Confirmed" <?= $status_filter=='Confirmed'?'selected':''; ?>>Confirmed</option>
+                    <option value="Visited" <?= $status_filter=='Visited'?'selected':''; ?>>Visited</option>
+                    <option value="Cancelled" <?= $status_filter=='Cancelled'?'selected':''; ?>>Cancelled</option>
                 </select>
-                <label class="form-label mt-3">Income Amount (Rs.)</label>
-                <input type="number" name="bonus_amount" class="form-control" min="0" step="0.01" required>
             </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button class="btn btn-success">Confirm Update</button>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Time Filter</label>
+                <select name="filter_type" id="filter_type" class="form-select" onchange="toggleDateRange()">
+                    <option value="all" <?= $filter_type=='all'?'selected':''; ?>>All</option>
+                    <option value="today" <?= $filter_type=='today'?'selected':''; ?>>Today</option>
+                    <option value="this_week" <?= $filter_type=='this_week'?'selected':''; ?>>This Week</option>
+                    <option value="this_month" <?= $filter_type=='this_month'?'selected':''; ?>>This Month</option>
+                    <option value="this_year" <?= $filter_type=='this_year'?'selected':''; ?>>This Year</option>
+                    <option value="custom" <?= $filter_type=='custom'?'selected':''; ?>>Custom Range</option>
+                </select>
+            </div>
+            <div class="col-md-2 custom-date d-none">
+                <label class="form-label fw-semibold">From</label>
+                <input type="date" name="from_date" class="form-control" value="<?= htmlspecialchars($from_date); ?>">
+            </div>
+            <div class="col-md-2 custom-date d-none">
+                <label class="form-label fw-semibold">To</label>
+                <input type="date" name="to_date" class="form-control" value="<?= htmlspecialchars($to_date); ?>">
+            </div>
+            <div class="col-md-2 text-end">
+                <button type="submit" class="btn btn-primary w-100">Apply</button>
             </div>
         </form>
+
+        <!-- Appointment Table -->
+        <?php if ($result->num_rows > 0): ?>
+            <div class="table-responsive">
+                <table class="table table-bordered table-hover align-middle table-striped">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Customer</th>
+                            <th>Contact</th>
+                            <th>Reason</th>
+                            <th>Appointment Date</th>
+                            <th>Status</th>
+                            <th>Income (Rs.)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php $count=1; while($row=$result->fetch_assoc()): ?>
+                        <tr class="appointment-row"
+                            data-customer="<?= htmlspecialchars($row['customer_name']); ?>"
+                            data-contact="<?= htmlspecialchars($row['number_called']); ?>"
+                            data-reason="<?= htmlspecialchars($row['appointment_reason']); ?>"
+                            data-date="<?= htmlspecialchars($row['appointment_date']); ?>"
+                            data-status="<?= htmlspecialchars($row['visit_status']); ?>"
+                            data-bonus="<?= number_format($row['bonus_amount'],2); ?>"
+                        >
+                            <td><?= $count++; ?></td>
+                            <td><?= htmlspecialchars($row['customer_name']); ?></td>
+                            <td><?= htmlspecialchars($row['number_called']); ?></td>
+                            <td><?= htmlspecialchars($row['appointment_reason']); ?></td>
+                            <td><?= htmlspecialchars($row['appointment_date']); ?></td>
+                            <td><span class="status-badge status-<?= htmlspecialchars($row['visit_status']); ?>" data-bs-toggle="tooltip" title="<?= htmlspecialchars($row['visit_status']); ?>"><?= htmlspecialchars($row['visit_status']); ?></span></td>
+                            <td class="text-success fw-semibold"><?= number_format($row['bonus_amount'],2); ?></td>
+                        </tr>
+                        <?php endwhile; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php else: ?>
+            <div class="alert alert-info text-center">
+                <strong>No appointments found for this period.</strong><br>Keep up the great work reaching new clients 🚀
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 
-<div id="toastContainer"></div>
+<!-- Modal for Appointment Details -->
+<div class="modal fade" id="appointmentModal" tabindex="-1" aria-labelledby="appointmentModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header bg-primary text-white">
+        <h5 class="modal-title" id="appointmentModalLabel">Appointment Details</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p><strong>Customer:</strong> <span id="modalCustomer"></span></p>
+        <p><strong>Contact:</strong> <span id="modalContact"></span></p>
+        <p><strong>Reason:</strong> <span id="modalReason"></span></p>
+        <p><strong>Date:</strong> <span id="modalDate"></span></p>
+        <p><strong>Status:</strong> <span id="modalStatus"></span></p>
+        <p><strong>Bonus (Rs.):</strong> <span id="modalBonus"></span></p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
 
-<!-- ===== JS ===== -->
-<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-<script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
-<script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
-<script src="https://cdn.datatables.net/buttons/2.4.1/js/dataTables.buttons.min.js"></script>
-<script src="https://cdn.datatables.net/buttons/2.4.1/js/buttons.bootstrap5.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.7/pdfmake.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.7/vfs_fonts.js"></script>
-<script src="https://cdn.datatables.net/buttons/2.4.1/js/buttons.html5.min.js"></script>
-<script src="https://cdn.datatables.net/buttons/2.4.1/js/buttons.print.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-
 <script>
-// DATATABLE with Export Buttons
-$('#appointmentsTable').DataTable({
-    "order": [[5, "asc"]],
-    dom: 'Bfrtip',
-    buttons: [
-        {
-            extend: 'excelHtml5',
-            text: '<i class="bi bi-file-earmark-excel"></i> Excel',
-            className: 'btn btn-success btn-sm'
-        },
-        {
-            extend: 'pdfHtml5',
-            text: '<i class="bi bi-file-earmark-pdf"></i> PDF',
-            className: 'btn btn-danger btn-sm',
-            orientation: 'landscape',
-            pageSize: 'A4'
-        },
-        {
-            extend: 'print',
-            text: '<i class="bi bi-printer"></i> Print',
-            className: 'btn btn-primary btn-sm'
-        }
-    ]
-});
-
-// OPEN MODAL
-$('.statusBtn').click(function(){
-    $('#update_id').val($(this).data('id'));
-    new bootstrap.Modal('#statusModal').show();
-});
-
-// SHOW TOAST
-function showToast(message, type='success'){
-    let toastId = 'toast-' + Date.now();
-    let toastHtml = `
-    <div id="${toastId}" class="toast align-items-center text-bg-${type} border-0 mb-2" role="alert" aria-live="assertive" aria-atomic="true">
-        <div class="d-flex">
-            <div class="toast-body">${message}</div>
-            <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
-        </div>
-    </div>`;
-    $('#toastContainer').append(toastHtml);
-    let toastEl = new bootstrap.Toast(document.getElementById(toastId), { delay: 3000 });
-    toastEl.show();
-}
-
-// SUBMIT STATUS UPDATE
-$('#statusForm').submit(function(e){
-    e.preventDefault();
-    $.post("update_visit_status.php", $(this).serialize(), function(res){
-        $('#statusModal').modal('hide');
-        showToast(res, 'success');
-        setTimeout(()=>{ location.reload(); }, 1500);
+// Sidebar dropdown
+document.querySelectorAll(".dropdown-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+        const dropdown = btn.nextElementSibling;
+        document.querySelectorAll(".dropdown-container").forEach(dc => { if(dc!==dropdown) dc.style.display='none'; });
+        dropdown.style.display = dropdown.style.display==='block'?'none':'block';
     });
 });
 
-// CANCEL BUTTON
-$('.cancelBtn').click(function(){
-    let id = $(this).data('id');
-    let name = $(this).data('name');
-    if(confirm(`Are you sure you want to cancel ${name}'s appointment?`)){
-        $.post("cancel_appointment.php", {id: id}, function(res){
-            showToast(res, 'danger');
-            setTimeout(()=>{ location.reload(); }, 1500);
-        });
-    }
+// Toggle custom date range
+function toggleDateRange() {
+    const filterType = document.getElementById('filter_type').value;
+    const dateFields = document.querySelectorAll('.custom-date');
+    dateFields.forEach(field => field.classList.toggle('d-none', filterType !== 'custom'));
+}
+toggleDateRange();
+
+// Enable tooltips
+const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+tooltipTriggerList.map(function (tooltipTriggerEl) {
+  return new bootstrap.Tooltip(tooltipTriggerEl)
 });
 
-// SIDEBAR DROPDOWN
-var dropdowns = document.getElementsByClassName("dropdown-btn");
-for (var i = 0; i < dropdowns.length; i++) {
-    dropdowns[i].addEventListener("click", function() {
-        this.classList.toggle("active");
-        var container = this.nextElementSibling;
-        container.style.display = (container.style.display === "block") ? "none" : "block";
+// Modal popup on row click
+document.querySelectorAll('.appointment-row').forEach(row => {
+    row.addEventListener('click', () => {
+        document.getElementById('modalCustomer').textContent = row.dataset.customer;
+        document.getElementById('modalContact').textContent = row.dataset.contact;
+        document.getElementById('modalReason').textContent = row.dataset.reason;
+        document.getElementById('modalDate').textContent = row.dataset.date;
+        document.getElementById('modalStatus').textContent = row.dataset.status;
+        document.getElementById('modalBonus').textContent = row.dataset.bonus;
+        const modal = new bootstrap.Modal(document.getElementById('appointmentModal'));
+        modal.show();
     });
-}
+});
 </script>
 </body>
 </html>

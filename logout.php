@@ -2,8 +2,8 @@
 session_start();
 
 // Remove ONLY admin session keys
-unset($_SESSION['admin_id']);
-unset($_SESSION['admin_name']);
+unset($_SESSION['customer_id']);
+unset($_SESSION['customer_name']);
 
 // Optional: admin login state reset
 // unset($_SESSION['admin_role']);  // if used
@@ -11,6 +11,6 @@ unset($_SESSION['admin_name']);
 // Do NOT use session_destroy() (will logout users also)
 
 // Redirect to admin login page
-header("Location: admin_login.php");
+header("Location: user_login.php");
 exit();
 ?>
